@@ -10,99 +10,155 @@
 # Added new variable for curtailment control
 # Added custom constraint to linopy for control of maximum curtailment of power generation
 
+# V2.0
+# Integrated LoadProfileGenerator (PyLPG)
+# Implemented generation of multiple pre-defined households
 
 # ---------------------------------TODO:------------------
-# Integrate RAMP or LoadProfileGenerator
+# Integrate RAMP 
+# Integrate "Standardlastprofile"
 # Integrate renewables.ninja data
 # Implement addition of new consumers
 # Implement a parser to control the simulation from the "outside"
-
 
 import pypsa
 import pandas as pd
 import numpy as np
 import matplotlib.pyplot as plt
+import os
+from pylpg import lpg_execution, lpgdata
+import matplotlib.pyplot as plt
 
-num_days = 7
+
+filename = "community_load_profile.csv"
+n_days = 21
+n_hours = 24 * n_days
+startdate = "2023-01-01"
+
+# --------------------------
+# Integration of pylpg for load profiles
+# --------------------------
+
+if os.path.exists(filename): # Load data if it already exists
+    # Load the CSV file into a DataFrame
+    community_load_profile = pd.read_csv(filename, index_col=0, parse_dates=True)
+    print("Loaded existing load profile from CSV.")
+else: # Generate load profile if it does not already exist
+    print("File not found. Generating load profile...")
+    # Generate load profiles
+    community_profiles = {
+    name: lpg_execution.execute_lpg_single_household(2024, household, house_type)["Electricity_HH1"].resample("h").sum()
+    for name, (household, house_type) in {
+        "Single_Person": (lpgdata.Households.CHR07_Single_with_work, lpgdata.HouseTypes.HT20_Single_Family_House_no_heating_cooling),
+        "Family": (lpgdata.Households.CHR27_Family_both_at_work_2_children, lpgdata.HouseTypes.HT18_Normal_House_with_15_000_kWh_Gas_Heating_and_a_hot_water_storage_tank),
+        "Retired_Couple": (lpgdata.Households.CHR54_Retired_Couple_no_work, lpgdata.HouseTypes.HT08_Normal_house_with_15_000_kWh_Heating_and_5_000_kWh_Cooling_Continuous_Flow_Electric_Heat_Pump)
+    }.items()
+    }
+
+    # Convert to DataFrame and save
+    community_load_profile = pd.DataFrame(community_profiles)
+    community_load_profile.to_csv("community_load_profile.csv")
+
+    print("Community load profile generated and saved as CSV.")
+
+total_load_curve = community_load_profile.sum(axis=1)  # Sum across all columns (households)
+
+# Only take the required amount of data points
+load_profile_hourly = total_load_curve.iloc[:n_hours]
+# Convert the hourly load profile to a list for PyPSA 
+if isinstance(load_profile_hourly, pd.Series):
+    load_profile_list = load_profile_hourly.tolist()
+else:
+    load_profile_list = load_profile_hourly.iloc[:, 0].tolist()
+
+# print("Resampled hourly load profile (first 50 values):", load_profile_list[:50])
+
+# --------------------------
+# PyPSA Model Setup
+# --------------------------
 
 # Create a new PyPSA network
 network = pypsa.Network()
 
-# Define time snapshots (24 hours * num_days)
-snapshots = pd.date_range("2023-01-01", periods=24 * num_days, freq="h")
+# Define time snapshots (n_hours, hourly resolution)
+snapshots = pd.date_range(startdate, periods=n_hours, freq="h")
 network.set_snapshots(snapshots)
 
 # Add an electricity carrier
 network.add("Carrier", "electricity")
 
+# Add buses (one for main, one for PV, one for battery)
 network.add("Bus", "main_bus", carrier="electricity")
 network.add("Bus", "pv_bus", carrier="electricity")
-network.add("Bus", "battery_bus", carrier="electricity")  # Separate bus for the battery
+network.add("Bus", "battery_bus", carrier="electricity")
 
-# Add a constant load of 20 kW
-load_profile = [20] * 24 * num_days
-network.add("Load", "constant_load", bus="main_bus", p_set=load_profile)
+# Add the load from pylpg
+network.add("Load", "household_load", bus="main_bus", p_set=load_profile_list)
+
+# # Add a constant load
+# network.add("Load", "Constant_Load", bus="main_bus", p_set=[20] * n_hours)
 
 # Add a PV generator
-pv_profile = [max(0, np.sin(np.pi * h / 24)) for h in range(24)] * num_days
-pv_profile_min = [max(0, 0*h) for h in range(24)] * num_days
+# Generate a PV profile over one day and  repeat it for n_days
+# Here, the sinusoidal profile represents the maximum per-unit PV output
+pv_profile_daily = [max(0, np.sin(np.pi * h / 24)) for h in range(24)]
+pv_profile = pv_profile_daily * n_days  # Repeat for each day
+
 network.add("Generator", "pv_generator",
             bus="pv_bus",
             carrier="electricity",
-            control = "PQ",
+            control="PQ",
             p_nom_extendable=True,
             capital_cost=100,  # €/kW
             marginal_cost=0,
-            p_nom=100,  # Initial PV size
-            p_nom_min = 10,
-            curtailment_rate_max = 0,
+            p_nom=100,  # Initial PV size (kW)
+            curtailment_rate_max=0,
             p_max_pu=pv_profile)
 
-
-e_nom_fixed= 150
+# Define battery parameters
+e_nom_fixed = 10  # kWh
 initial_state_of_charge = 0.8
-# Add a Store to represent the battery
+
+# Add a Store to represent the battery storage
 network.add("Store", "battery_storage",
             bus="battery_bus",
             carrier="electricity",
-            e_nom=e_nom_fixed,  # Storage capacity 
-            e_nom_max = 1000,
-            e_nom_extendable=True,  
-            capital_cost=150,  # €/kWh
-            marginal_cost = 0,
-            e_initial=e_nom_fixed*initial_state_of_charge,  # Initial energy stored
-            e_cyclic=True)  # Cyclic SoC
+            e_nom=e_nom_fixed,  # Storage capacity (kWh)
+            e_nom_extendable=True,
+            capital_cost=300,  # €/kWh
+            marginal_cost=0,
+            e_initial=e_nom_fixed * initial_state_of_charge,  # Initial stored energy (kWh)
+            e_cyclic=True)
 
-# Add Links for Charging and Discharging the Battery
-# Charging Link (Power flows from main_bus to battery_bus)
+# Charging Link: from pv_bus to battery_bus
 network.add("Link", "battery_charge",
             bus0="pv_bus",
             bus1="battery_bus",
             carrier="electricity",
             marginal_cost=0,
-            efficiency=0.9,  # Charging efficiency
-            p_nom=15,  # Charging power 
-            p_nom_extendable=False)
+            efficiency=0.8,  # Charging efficiency
+            p_nom=15,        # Maximum charging power (kW)
+            p_nom_extendable=True)
 
-# Discharging Link (Power flows from battery_bus to main_bus)
+# Discharging Link: from battery_bus to main_bus
 network.add("Link", "battery_discharge",
             bus0="battery_bus",
             bus1="main_bus",
             carrier="electricity",
             marginal_cost=0,
-            efficiency=0.9,  # Discharging efficiency
-            p_nom=40,  # Discharging power 
-            p_nom_extendable=False)
+            efficiency=0.8,  # Discharging efficiency
+            p_nom=40,        # Maximum discharging power (kW)
+            p_nom_extendable=True)
 
-# Direct Link (Power flows from pv_bus to main_bus)
+# Direct Link: from pv_bus to main_bus (PV directly serving the load)
 network.add("Link", "pv_to_load",
             bus0="pv_bus",
             bus1="main_bus",
             carrier="electricity",
             marginal_cost=0,
-            efficiency=1.0,  
-            p_nom=40, 
-            p_nom_extendable=False)
+            efficiency=1.0,
+            p_nom=40,
+            p_nom_extendable=True)
 
 #  Custom Constraint 
 def define_cons_max_curtailment(network, generator_name):
@@ -129,12 +185,11 @@ def define_cons_max_curtailment(network, generator_name):
         name=f"{generator_name}_max_curtailment",
     )
 
-
-
 network.optimize.create_model() # Create the model
 define_cons_max_curtailment(network, generator_name="pv_generator") # Attach the constraint before solving
 print(network.model) # print all variables and constrains used in the model
 network.optimize.solve_model() # Solve model
+
 
 # Print optimal values
 print("Optimized PV Capacity (kW):", network.generators.p_nom_opt["pv_generator"])
@@ -143,44 +198,71 @@ print("Direct link to consumer (kW):", network.links.p_nom_opt["pv_to_load"])
 print("Link to Charge (kW):", network.links.p_nom_opt["battery_charge"])
 print("Link to Discharge (kW):", network.links.p_nom_opt["battery_discharge"])
 
-# Extract results
+
+
+# Extract results for plotting
 battery_soc = network.stores_t.e["battery_storage"]
-load_profile = network.loads_t.p["constant_load"]
-pv_generation = network.generators_t.p["pv_generator"]
-battery_charge = network.links_t.p0["battery_charge"]
-battery_discharge = network.links_t.p0["battery_discharge"]
+load_profile_res = network.loads_t.p["household_load"]
+pv_generation_res = network.generators_t.p["pv_generator"]
+battery_charge_res = network.links_t.p0["battery_charge"]
+battery_discharge_res = network.links_t.p0["battery_discharge"]
 direct = network.links_t.p0["pv_to_load"]
 
-# Plot everything
-plt.figure(figsize=(12, 6))
+# Fetch optimized values
+optimized_pv = network.generators.p_nom_opt["pv_generator"]
+optimized_battery = network.stores.e_nom_opt["battery_storage"]
+optimized_direct_link = network.links.p_nom_opt["pv_to_load"]
+optimized_battery_charge = network.links.p_nom_opt["battery_charge"]
+optimized_battery_discharge = network.links.p_nom_opt["battery_discharge"]
 
-# Plot Battery SoC
-plt.plot(network.snapshots, battery_soc, label="Battery SoC (kWh)", color="blue", marker="o")
+# Create figure with two subplots
+fig, axes = plt.subplots(nrows=2, ncols=1, figsize=(12, 8), sharex=True, gridspec_kw={'height_ratios': [1, 1]})
 
-# Plot Load
-plt.plot(network.snapshots, load_profile, label="Load (kW)", color="red", linestyle="-", marker="x")
+markersize = 5
+linewidth_dashed = 2
+linewidth_dotted = linewidth_dashed+1
+# --- Subplot 1: Load, PV Generation, and Battery Interaction ---
+axes[0].plot(network.snapshots, load_profile_res, label="Load (kW)", color="red", linestyle="-", marker="x", markersize = markersize)
+axes[0].plot(network.snapshots, pv_generation_res, label="PV Generation (kW)", color="green", linestyle="--", linewidth = linewidth_dashed)
+axes[0].plot(network.snapshots, direct, label="Direct to Load (kW)", color="brown", marker="v", markersize = markersize)
+axes[0].plot(network.snapshots, -battery_charge_res, label="Battery Charging (kW)", linestyle="dotted", color="purple", linewidth = linewidth_dotted)
+axes[0].plot(network.snapshots, battery_discharge_res, label="Battery Discharging (kW)", linestyle="dotted", color="orange", linewidth = linewidth_dotted)
 
-# Plot PV Generation
-plt.plot(network.snapshots, pv_generation, label="PV Generation (kW)", color="green", linestyle="--")
-plt.plot(network.snapshots, direct, label="Direct to load (kW)", color="brown", marker="v")
+axes[0].set_title("Power Flow in the Microgrid")
+axes[0].set_ylabel("Power (kW)")
+axes[0].legend()
+axes[0].grid()
 
-# Plot Battery Charge/Discharge
-plt.plot(network.snapshots, battery_charge, label="Battery Charging (kW)", linestyle="dotted", color="purple")
-plt.plot(network.snapshots, -battery_discharge, label="Battery Discharging (kW)", linestyle="dotted", color="orange")
+# --- Subplot 2: Battery SoC ---
+axes[1].plot(network.snapshots, battery_soc, label="Battery SoC (kWh)", color="blue", marker="o", markersize = markersize)
 
-# Add a line for battery capacity
-if network.stores.e_nom_opt.empty:    
-    plt.axhline(y=network.stores.e_nom["battery_storage"], color="gray", linestyle="--", label="Battery Capacity (kWh)")
+if network.stores.e_nom_opt.empty:
+    battery_capacity = network.stores.e_nom["battery_storage"]
 else:
-    plt.axhline(y=network.stores.e_nom_opt["battery_storage"], color="gray", linestyle="--", label="Battery Capacity (kWh)")
-# Add titles, labels, and legend
-plt.title("Microgrid Operation Over Time")
-plt.xlabel("Time")
-plt.ylabel("Energy or Power (kWh or kW)")
-plt.xticks(rotation=45)
-plt.legend()
-plt.grid()
-plt.tight_layout()
+    battery_capacity = network.stores.e_nom_opt["battery_storage"]
+axes[1].axhline(y=battery_capacity, color="gray", linestyle="--", label="Battery Capacity (kWh)")
 
-# Show the plot
+axes[1].set_title("Battery State of Charge")
+axes[1].set_xlabel("Time")
+axes[1].set_ylabel("Energy (kWh)")
+axes[1].legend()
+axes[1].grid()
+
+# --- Add Textbox with Optimized Values ---
+textstr = (
+    f"Optimized PV Capacity: {optimized_pv:.2f} kW\n"
+    f"Battery Capacity: {optimized_battery:.2f} kWh\n"
+    f"Direct Link Capacity: {optimized_direct_link:.2f} kW\n"
+    f"Battery Charge Capacity: {optimized_battery_charge:.2f} kW\n"
+    f"Battery Discharge Capacity: {optimized_battery_discharge:.2f} kW"
+)
+
+# Add textbox in the first subplot
+props = dict(boxstyle='round', facecolor='lightgreen', alpha=0.5)
+axes[0].text(0.02, 0.98, textstr, transform=axes[0].transAxes, fontsize=10,
+             verticalalignment='top', bbox=props)
+
+# --- Final Adjustments ---
+plt.xticks(rotation=45, ha="right", rotation_mode="anchor")
+plt.tight_layout()
 plt.show()
