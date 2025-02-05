@@ -14,26 +14,94 @@
 # Integrated LoadProfileGenerator (PyLPG)
 # Implemented generation of multiple pre-defined households
 
+# V2.1
+# Integrated renewables.ninja data
+# adjusted timeframing of simulation to enable renewables.ninja data
+
 # ---------------------------------TODO:------------------
 # Integrate RAMP 
 # Integrate "Standardlastprofile"
-# Integrate renewables.ninja data
 # Implement addition of new consumers
 # Implement a parser to control the simulation from the "outside"
 
 import pypsa
+from pylpg import lpg_execution, lpgdata
+
+import requests
+import json
+import io
 import pandas as pd
 import numpy as np
 import matplotlib.pyplot as plt
 import os
-from pylpg import lpg_execution, lpgdata
-import matplotlib.pyplot as plt
-
+from datetime import datetime, timedelta
 
 filename = "community_load_profile.csv"
-n_days = 21
+n_days = 21 # MUST BE GREATER THAN 1
 n_hours = 24 * n_days
 startdate = "2023-01-01"
+
+# Convert string to datetime object, add n_days and convert it back
+startdate_dt = datetime.strptime(startdate, "%Y-%m-%d")
+enddate_dt = startdate_dt + timedelta(days=n_days-1)
+enddate = enddate_dt.strftime("%Y-%m-%d")
+
+# --------------------------
+# Integration of renewables.ninja for pv generation profiles
+# --------------------------
+
+
+token = 'd0c7b389b3a5523e6d4c23c64776e0539ad5e543'
+api_base = 'https://www.renewables.ninja/api/'
+
+session = requests.session()
+# Send token header with each request
+session.headers = {'Authorization': 'Token ' + token}
+
+url = api_base + 'data/pv'
+
+args = {
+    "lat": 48.2082,   # Example: Vienna, Austria
+    "lon": 16.3738,
+    "date_from": startdate,
+    "date_to": enddate,
+    "dataset": "merra2",  # Options: "merra2" or "era5"
+    "capacity": 1.0,
+    "system_loss": 0.0,
+    "tracking": 0,  
+    "tilt": 35,
+    "azim": 180,
+    "format": "json"
+}
+
+request = session.get(url, params=args)
+
+# Parse JSON to get a pandas.DataFrame of data and dict of metadata
+parsed_response = json.loads(request.text)
+
+json_data = json.dumps(parsed_response["data"])  # Convert dictionary to JSON string
+data = pd.read_json(io.StringIO(json_data), orient="index")
+metadata = parsed_response['metadata']
+# Convert JSON to Pandas DataFrame
+pv_profile = pd.DataFrame(data)
+pv_profile.index = pd.to_datetime(pv_profile.index)
+
+# Resample to hourly values
+pv_profile_hourly = pv_profile.resample("h").mean()
+
+# Save to CSV for later use
+pv_profile_hourly.to_csv("pv_profile_hourly.csv")
+
+# Load saved Renewables.ninja PV profile
+pv_profile_RenewablesNinja = pd.read_csv("pv_profile_hourly.csv", index_col=0, parse_dates=True)
+
+pv_profile = pv_profile_RenewablesNinja
+# Convert the pv profile to a list for PyPSA 
+if isinstance(pv_profile, pd.Series):
+    pv_profile_list = pv_profile.tolist()
+else:
+    pv_profile_list = pv_profile.iloc[:, 0].tolist()
+
 
 # --------------------------
 # Integration of pylpg for load profiles
@@ -101,9 +169,11 @@ network.add("Load", "household_load", bus="main_bus", p_set=load_profile_list)
 # Add a PV generator
 # Generate a PV profile over one day and  repeat it for n_days
 # Here, the sinusoidal profile represents the maximum per-unit PV output
-pv_profile_daily = [max(0, np.sin(np.pi * h / 24)) for h in range(24)]
-pv_profile = pv_profile_daily * n_days  # Repeat for each day
+# pv_profile_daily_sinusoidal = [max(0, np.sin(np.pi * h / 24)) for h in range(24)]
+# pv_profile = pv_profile_daily_sinusoidal * n_days  # Repeat for each day
 
+# Align the PV profile with PyPSA snapshots
+# pv_profile = pv_profile_RenewablesNinja.reindex(network.snapshots, method="nearest")  # Match closest timestamps
 network.add("Generator", "pv_generator",
             bus="pv_bus",
             carrier="electricity",
@@ -113,7 +183,7 @@ network.add("Generator", "pv_generator",
             marginal_cost=0,
             p_nom=100,  # Initial PV size (kW)
             curtailment_rate_max=0,
-            p_max_pu=pv_profile)
+            p_max_pu=pv_profile_list)
 
 # Define battery parameters
 e_nom_fixed = 10  # kWh
