@@ -16,13 +16,22 @@
 
 # V2.1
 # Integrated renewables.ninja data
-# adjusted timeframing of simulation to enable renewables.ninja data
+# Adjusted timeframing of simulation to enable renewables.ninja data
+
+# V2.2
+# Integrated RAMP load curve generation
+# Synchronized datetimes for RAMP and PyPSA
+# Combined LPG and RAMP load curves into a total load on the power grid
 
 # ---------------------------------TODO:------------------
-# Integrate RAMP 
 # Integrate "Standardlastprofile"
 # Implement addition of new consumers
-# Implement a parser to control the simulation from the "outside"
+# Implement a parser to control the simulation 
+
+
+from ramp.post_process import post_process as pp
+from ramp.core.core import UseCase
+from ramp.core.core import User
 
 import pypsa
 from pylpg import lpg_execution, lpgdata
@@ -36,29 +45,236 @@ import matplotlib.pyplot as plt
 import os
 from datetime import datetime, timedelta
 
-filename = "community_load_profile.csv"
+filename_LPG = "community_load_profile.csv"
 n_days = 21 # MUST BE GREATER THAN 1
 n_hours = 24 * n_days
 startdate = "2023-01-01"
+
+# --------------------------
+# Integration of RAMP for load curve generation
+# --------------------------
+
+# RAMP does not deal with units of measures, you should check the consistency of the unit of measures throughout your model
+User_list = []
+
+# Create new user classes
+Hospital = User("hospital", 1)
+User_list.append(Hospital)
+
+School = User("school", 1)
+User_list.append(School)
+
+Public_lighting = User("public lighting", 1)
+User_list.append(Public_lighting)
+
+Church = User("church", 3)
+User_list.append(Church)
+
+# Create new appliances
+# Church
+Ch_indoor_bulb = Church.add_appliance(
+    number=10, # how many of this appliance each user has in this user category
+    power=26, # the power [Watt] of each single appliance. 
+    num_windows=1, # how many usage time windows throughout the day?
+    func_time=210, # the total usage time of appliances [min]
+    time_fraction_random_variability=0.2, # randomizes the total time the appliance is on (between 0 and 1)
+    func_cycle=60, # the minimum usage time after a switch on event [min]
+    fixed="yes", # This means all the 'n' appliances of this kind are always switched-on together
+    flat="yes", # This means the appliance is not subject to random variability in terms of total usage time
+    name="indoor_bulb",
+)
+Ch_indoor_bulb.windows(window_1=[1200, 1440], window_2=[0, 0], random_var_w=0.1) # from 20:00 to 24:00
+
+Ch_outdoor_bulb = Church.add_appliance(
+    7, 26, 1, 150, 0.2, 60, "yes", flat="yes", name="outdoor_bulb"
+)
+Ch_outdoor_bulb.windows([1200, 1440], [0, 0], 0.1) 
+
+Ch_speaker = Church.add_appliance(1, 100, 1, 150, 0.2, 60, name="speaker")
+Ch_speaker.windows([1200, 1350], [0, 0], 0.1)
+
+# Public lighting
+Pub_lights = Public_lighting.add_appliance(
+    12, 40, 2, 310, 0.1, 300, "yes", flat="yes", name="lights"
+)
+Pub_lights.windows([0, 336], [1110, 1440], 0.2)
+
+Pub_lights_2 = Public_lighting.add_appliance(
+    25, 150, 2, 310, 0.1, 300, "yes", flat="yes", name="lights2"
+)
+Pub_lights_2.windows([0, 336], [1110, 1440], 0.2)
+
+# Hospital
+Ho_indoor_bulb = Hospital.add_appliance(12, 7, 2, 690, 0.2, 10, name="indoor_bulb")
+Ho_indoor_bulb.windows([480, 720], [870, 1440], 0.35)
+
+Ho_outdoor_bulb = Hospital.add_appliance(1, 13, 2, 690, 0.2, 10, name="outdoor_bulb")
+Ho_outdoor_bulb.windows([0, 330], [1050, 1440], 0.35)
+
+Ho_Phone_charger = Hospital.add_appliance(8, 2, 2, 300, 0.2, 5, name="phone_charger")
+Ho_Phone_charger.windows([480, 720], [900, 1440], 0.35)
+
+# specific_cycle_1 is used for assigining the first specific duty cycle for the appliace (maximum of three cycles can be assigned)
+# Parameters:
+    # p_11 : float, optional
+    # Power rating for first part of first duty cycle. Only necessary if fixed_cycle is set to 1 or greater, by default 0
+    # t_11 : int[0,1440], optional
+    # Duration (minutes) of first part of first duty cycle. Only necessary if fixed_cycle is set to 1 or greater, by default 0
+    # p_12 : int, float, optional
+    # Power rating for second part of first duty cycle. Only necessary if fixed_cycle is set to 1 or greater, by default 0
+    # t_12 : int[0,1440], optional
+    # Duration (minutes) of second part of first duty cycle. Only necessary if fixed_cycle is set to 1 or greater, by default 0
+    # r_c1 : Percentage [0,1], optional
+    # randomization of the duty cycle parts duration. There will be a uniform random variation around t_i1 and t_i2. If this parameter is set to 0.1, then t_i1 and t_i2 will be randomly reassigned between 90% and 110% of their initial value; 0 means no randomisation, by default 0
+    # w11 : Iterable, optional
+    # Window time range for the first part of first duty cycle number (not neccessarily linked to the overall time window), by default None
+    # cw12 : Iterable, optional
+    # Window time range for the first part of first duty cycle number (not neccessarily linked to the overall time window), by default None, by default None     
+
+Ho_Fridge = Hospital.add_appliance(1, 150, 1, 1440, 0, 30, "yes", 3, name="fridge")
+Ho_Fridge.windows([0, 1440], [0, 0])
+Ho_Fridge.specific_cycle_1(p_11= 150,t_11= 20, p_12=5, t_12=10)
+Ho_Fridge.specific_cycle_2(150, 15, 5, 15)
+Ho_Fridge.specific_cycle_3(150, 10, 5, 20)
+Ho_Fridge.cycle_behaviour(
+    cw11=[580, 1200], cw12=[0, 0], cw21=[420, 579], cw22=[0, 0], cw31=[0, 419], cw32=[1201, 1440]
+)
+# different time windows can be associated with different specific duty cycles
+# Parameters
+# cw11 : Iterable, optional
+# Window time range for the first part of first duty cycle number, by default np.array([0,0])
+# cw12 : Iterable, optional
+# Window time range for the second part of first duty cycle number, by default np.array([0,0])
+# cw21 : Iterable, optional
+# Window time range for the first part of second duty cycle number, by default np.array([0,0])
+# cw22 : Iterable, optional
+# Window time range for the second part of second duty cycle number, by default np.array([0,0])
+# cw31 : Iterable, optional
+# Window time range for the first part of third duty cycle number, by default np.array([0,0])
+# cw32 : Iterable, optional
+# Window time range for the second part of third duty cycle number, by default np.array([0,0])
+
+Ho_Fridge2 = Hospital.add_appliance(1, 150, 1, 1440, 0, 30, "yes", 3, name="fridge2")
+Ho_Fridge2.windows([0, 1440], [0, 0])
+Ho_Fridge2.specific_cycle_1(150, 20, 5, 10)
+Ho_Fridge2.specific_cycle_2(150, 15, 5, 15)
+Ho_Fridge2.specific_cycle_3(150, 10, 5, 20)
+Ho_Fridge2.cycle_behaviour(
+    [580, 1200], [0, 0], [420, 579], [0, 0], [0, 419], [1201, 1440]
+)
+
+Ho_Fridge3 = Hospital.add_appliance(1, 150, 1, 1440, 0.1, 30, "yes", 3, name="fridge3")
+Ho_Fridge3.windows([0, 1440], [0, 0])
+Ho_Fridge3.specific_cycle_1(150, 20, 5, 10)
+Ho_Fridge3.specific_cycle_2(150, 15, 5, 15)
+Ho_Fridge3.specific_cycle_3(150, 10, 5, 20)
+Ho_Fridge3.cycle_behaviour(
+    [580, 1200], [0, 0], [420, 579], [0, 0], [0, 419], [1201, 1440]
+)
+
+Ho_PC = Hospital.add_appliance(2, 50, 2, 300, 0.1, 10, name="PC")
+Ho_PC.windows([480, 720], [1050, 1440], 0.35)
+
+Ho_Mixer = Hospital.add_appliance(
+    1, 50, 2, 60, 0.1, 1, occasional_use=0.33, name="mixer"
+)
+Ho_Mixer.windows([480, 720], [1050, 1440], 0.35)
+
+# School
+S_indoor_bulb = School.add_appliance(8, 7, 1, 60, 0.2, 10, name="indoor_bulb")
+S_indoor_bulb.windows([1020, 1080], [0, 0], 0.35)
+
+S_outdoor_bulb = School.add_appliance(6, 13, 1, 60, 0.2, 10, name="outdoor_bulb")
+S_outdoor_bulb.windows([1020, 1080], [0, 0], 0.35)
+
+S_Phone_charger = School.add_appliance(5, 2, 2, 180, 0.2, 5, name="phone_charger")
+S_Phone_charger.windows([510, 750], [810, 1080], 0.35)
+
+S_PC = School.add_appliance(18, 50, 2, 210, 0.1, 10, name="PC")
+S_PC.windows([510, 750], [810, 1080], 0.35)
+
+S_Printer = School.add_appliance(1, 20, 2, 30, 0.1, 5, name="printer")
+S_Printer.windows([510, 750], [810, 1080], 0.35)
+
+S_Freezer = School.add_appliance(1, 200, 1, 1440, 0, 30, "yes", 3, name="freezer")
+S_Freezer.windows([0, 1440])
+S_Freezer.specific_cycle_1(200, 20, 5, 10)
+S_Freezer.specific_cycle_2(200, 15, 5, 15)
+S_Freezer.specific_cycle_3(200, 10, 5, 20)
+S_Freezer.cycle_behaviour(
+    [580, 1200], [0, 0], [510, 579], [0, 0], [0, 509], [1201, 1440]
+)
+
+S_TV = School.add_appliance(1, 60, 2, 120, 0.1, 5, occasional_use=0.5, name="TV")
+S_TV.windows([510, 750], [810, 1080], 0.35)
+
+S_DVD = School.add_appliance(1, 8, 2, 120, 0.1, 5, occasional_use=0.5, name="DVD")
+S_DVD.windows([510, 750], [810, 1080], 0.35)
+
+S_Stereo = School.add_appliance(
+    1, 150, 2, 90, 0.1, 5, occasional_use=0.33, name="stereo"
+)
+S_Stereo.windows([510, 750], [810, 1080], 0.35)
+
+
+uc = UseCase(
+    users=User_list,
+    parallel_processing=False,
+)
+uc.initialize(num_days=n_days, peak_enlarge=0.15)
+
+Profiles_list = uc.generate_daily_load_profiles(flat=False)
+
+Profiles_avg, Profiles_list_kW, Profiles_series = pp.Profile_formatting(Profiles_list)
+
+# pp.Profile_series_plot(Profiles_series)  # by default, profiles are plotted as a series
+
+# if (
+#     len(Profiles_list) > 1
+# ):  # if more than one daily profile is generated, also cloud plots are shown
+#     pp.Profile_cloud_plot(Profiles_list, Profiles_avg)
+
+filename_RAMP = "Load_Profiles_total_average_hourly.csv"
+Profiles_avg_kW = np.array(Profiles_avg)/1000
+Profiles_series_kW = np.array(Profiles_series)/1000
+
+Profiles_avg_df = pd.DataFrame(Profiles_avg_kW)
+profiles_index = pd.date_range(start=startdate, periods=len(Profiles_avg_df), freq="min")
+Profiles_avg_df.index = profiles_index
+Profiles_avg_df_hourly = Profiles_avg_df.resample("h").mean()
+Profiles_avg_df_hourly.to_csv("Load_Profiles_daily_average_hourly.csv", index=True)
+
+Profiles_series_df = pd.DataFrame(Profiles_series_kW)
+profiles_index_series = pd.date_range(start=startdate, periods=len(Profiles_series_df), freq="min")
+Profiles_series_df.index = profiles_index_series
+Profiles_series_df_hourly = Profiles_series_df.resample("h").mean()
+Profiles_series_df_hourly.to_csv("Load_Profiles_total_average_hourly.csv", index=True)
+
+RAMP_total_load_profile_hourly_kW = pd.read_csv(filename_RAMP, index_col=0, parse_dates=True)
+
+# Convert the hourly load profile to a list for PyPSA 
+if isinstance(RAMP_total_load_profile_hourly_kW, pd.Series):
+    RAMP_total_load_profile_list = RAMP_total_load_profile_hourly_kW.tolist()
+else:
+    RAMP_total_load_profile_list = RAMP_total_load_profile_hourly_kW.iloc[:, 0].tolist()
+
+# --------------------------
+# Integration of renewables.ninja for pv generation profiles
+# --------------------------
 
 # Convert string to datetime object, add n_days and convert it back
 startdate_dt = datetime.strptime(startdate, "%Y-%m-%d")
 enddate_dt = startdate_dt + timedelta(days=n_days-1)
 enddate = enddate_dt.strftime("%Y-%m-%d")
 
-# --------------------------
-# Integration of renewables.ninja for pv generation profiles
-# --------------------------
-
 
 token = 'd0c7b389b3a5523e6d4c23c64776e0539ad5e543'
-api_base = 'https://www.renewables.ninja/api/'
+url_base = 'https://www.renewables.ninja/api/'
+url = url_base + 'data/pv'
 
 session = requests.session()
 # Send token header with each request
 session.headers = {'Authorization': 'Token ' + token}
-
-url = api_base + 'data/pv'
 
 args = {
     "lat": 48.2082,   # Example: Vienna, Austria
@@ -73,7 +289,7 @@ args = {
     "azim": 180,
     "format": "json"
 }
-
+# Request data from https://www.renewables.ninja/api/
 request = session.get(url, params=args)
 
 # Parse JSON to get a pandas.DataFrame of data and dict of metadata
@@ -102,14 +318,13 @@ if isinstance(pv_profile, pd.Series):
 else:
     pv_profile_list = pv_profile.iloc[:, 0].tolist()
 
-
 # --------------------------
 # Integration of pylpg for load profiles
 # --------------------------
 
-if os.path.exists(filename): # Load data if it already exists
+if os.path.exists(filename_LPG): # Load data if it already exists
     # Load the CSV file into a DataFrame
-    community_load_profile = pd.read_csv(filename, index_col=0, parse_dates=True)
+    community_load_profile = pd.read_csv(filename_LPG, index_col=0, parse_dates=True)
     print("Loaded existing load profile from CSV.")
 else: # Generate load profile if it does not already exist
     print("File not found. Generating load profile...")
@@ -135,9 +350,12 @@ total_load_curve = community_load_profile.sum(axis=1)  # Sum across all columns 
 load_profile_hourly = total_load_curve.iloc[:n_hours]
 # Convert the hourly load profile to a list for PyPSA 
 if isinstance(load_profile_hourly, pd.Series):
-    load_profile_list = load_profile_hourly.tolist()
+    LPG_load_profile_list = load_profile_hourly.tolist()
 else:
-    load_profile_list = load_profile_hourly.iloc[:, 0].tolist()
+    LPG_load_profile_list = load_profile_hourly.iloc[:, 0].tolist()
+
+# Piecewise addition of the two load profiles from RAMP and LPG
+total_load = (np.array(RAMP_total_load_profile_list) + np.array(LPG_load_profile_list)).tolist()
 
 # print("Resampled hourly load profile (first 50 values):", load_profile_list[:50])
 
@@ -161,7 +379,7 @@ network.add("Bus", "pv_bus", carrier="electricity")
 network.add("Bus", "battery_bus", carrier="electricity")
 
 # Add the load from pylpg
-network.add("Load", "household_load", bus="main_bus", p_set=load_profile_list)
+network.add("Load", "household_load", bus="main_bus", p_set=total_load)
 
 # # Add a constant load
 # network.add("Load", "Constant_Load", bus="main_bus", p_set=[20] * n_hours)
