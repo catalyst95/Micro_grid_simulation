@@ -23,11 +23,20 @@
 # Synchronized datetimes for RAMP and PyPSA
 # Combined LPG and RAMP load curves into a total load on the power grid
 
-# ---------------------------------TODO:------------------
-# Integrate "Standardlastprofile"
+# V2.3
+# Integrated Standard load profiles from the BDEW
+# Implemented R to Python interface via rpy2 package
+
+# ---------------------------------TODO---------------------------------
 # Implement addition of new consumers
 # Implement a parser to control the simulation 
+# Develop E-Mobility model
+# Nachvollziehbarkeit der Berechnung sicherstellen
+# Prepare for RAMP input via .csv (or .xlsx) from VITO 
 
+import rpy2.robjects as robjects
+import rpy2.robjects.packages as rpackages
+from rpy2.robjects import pandas2ri
 
 from ramp.post_process import post_process as pp
 from ramp.core.core import UseCase
@@ -45,12 +54,97 @@ import matplotlib.pyplot as plt
 import os
 from datetime import datetime, timedelta
 
-filename_LPG = "community_load_profile.csv"
-n_days = 21 # MUST BE GREATER THAN 1
+
+n_days = 14 # MUST BE GREATER THAN 1
 n_hours = 24 * n_days
 startdate = "2023-01-01"
+# Convert string to datetime object, add n_days and convert it back
+startdate_dt = datetime.strptime(startdate, "%Y-%m-%d")
+enddate_dt = startdate_dt + timedelta(days=n_days-1)
+enddate = enddate_dt.strftime("%Y-%m-%d")
 
+#%% --------------------------
+# Integration of Standard load profiles according to BDEW
 # --------------------------
+
+# Set R_HOME dynamically
+os.environ["R_HOME"] = "C:\Program Files\R\R-4.4.2"
+os.environ["R_USER"] = "C:\Program Files\R\R-4.4.2"
+print(robjects.r("R.version.string"))  # Should return the R version
+
+
+utils = rpackages.importr('utils')
+utils.chooseCRANmirror(ind=1)  # Choose a CRAN mirror if installing packages
+
+# Import R Package
+standardlastprofile = rpackages.importr("standardlastprofile")
+
+# Define the R function in Python
+slp_generate = robjects.r['slp_generate']
+
+# Define consumer types and their annual energy consumption
+consumers = {
+    "H0_1": {"profile": "H0", "estimated_annual_consumption": 2000},  # Household 1
+    "H0_2": {"profile": "H0", "estimated_annual_consumption": 3000},  # Household 2
+    "G0": {"profile": "G0", "estimated_annual_consumption": 10000},   # Business 1
+}
+state_code = "DE-BW"  # Baden-Württemberg
+
+# Dictionary to store all profiles
+load_profiles = {}
+pandas2ri.activate()
+filename_SLP = "SLP_total_load_profiles"
+
+if os.path.exists(filename_SLP): # Load data if it already exists
+    # Load saved SLP profile
+    SLP_total_load_profiles = pd.read_csv(filename_SLP, index_col=0, parse_dates=True)
+else: 
+    # Generate and process each consumer's profile
+    for name, details in consumers.items():
+        print(f"Generating load profile for {name} ({details['profile']})...")
+
+        # Call R function
+        r_df = slp_generate(details["profile"], startdate, enddate, state_code)
+        df = pandas2ri.rpy2py_dataframe(r_df)
+        # print (df.head())
+        # Convert time column
+        df["start_time"] = pd.to_datetime(df["start_time"])
+        df.set_index("start_time", inplace=True)
+
+        # Keep only numeric values
+        df_numeric = df[["watts"]]
+        df_numeric = df[["watts"]].copy()
+        df_numeric["watts"] /= 1000  # Convert from W to kW
+        column_name ="kW"
+        df_numeric.rename(columns={"watts": column_name}, inplace=True) # Rename column
+
+        # Scale to match the desired annual consumption
+        current_annual_consumption = 1000 # [kWh/a] according to the BDEW
+        scaling_factor = details["estimated_annual_consumption"] / current_annual_consumption
+        df_numeric[column_name] *= scaling_factor
+
+        # Resample to hourly
+        df_hourly = df_numeric.resample("h").mean()
+
+        # Store result
+        load_profiles[name] = df_hourly
+
+        print(f"{name} generated and scaled. Scaling factor: {scaling_factor:.2f}")
+
+    # Combine all profiles into a single DataFrame (sum all consumers)
+    total_load = sum(load_profiles.values())
+    print(total_load.head())
+    # Save results
+    total_load.to_csv(filename_SLP)
+    SLP_total_load_profiles = total_load
+
+# Convert the pv profile to a list for PyPSA 
+if isinstance(SLP_total_load_profiles, pd.Series):
+    SLP_total_load_profiles_list = SLP_total_load_profiles.tolist()
+else:
+    SLP_total_load_profiles_list = SLP_total_load_profiles.iloc[:, 0].tolist()
+
+#%% --------------------------
 # Integration of RAMP for load curve generation
 # --------------------------
 
@@ -258,14 +352,11 @@ if isinstance(RAMP_total_load_profile_hourly_kW, pd.Series):
 else:
     RAMP_total_load_profile_list = RAMP_total_load_profile_hourly_kW.iloc[:, 0].tolist()
 
-# --------------------------
+#%% --------------------------
 # Integration of renewables.ninja for pv generation profiles
 # --------------------------
 
-# Convert string to datetime object, add n_days and convert it back
-startdate_dt = datetime.strptime(startdate, "%Y-%m-%d")
-enddate_dt = startdate_dt + timedelta(days=n_days-1)
-enddate = enddate_dt.strftime("%Y-%m-%d")
+
 
 
 token = 'd0c7b389b3a5523e6d4c23c64776e0539ad5e543'
@@ -318,10 +409,10 @@ if isinstance(pv_profile, pd.Series):
 else:
     pv_profile_list = pv_profile.iloc[:, 0].tolist()
 
-# --------------------------
+#%% --------------------------
 # Integration of pylpg for load profiles
 # --------------------------
-
+filename_LPG = "community_load_profile.csv"
 if os.path.exists(filename_LPG): # Load data if it already exists
     # Load the CSV file into a DataFrame
     community_load_profile = pd.read_csv(filename_LPG, index_col=0, parse_dates=True)
@@ -354,12 +445,7 @@ if isinstance(load_profile_hourly, pd.Series):
 else:
     LPG_load_profile_list = load_profile_hourly.iloc[:, 0].tolist()
 
-# Piecewise addition of the two load profiles from RAMP and LPG
-total_load = (np.array(RAMP_total_load_profile_list) + np.array(LPG_load_profile_list)).tolist()
-
-# print("Resampled hourly load profile (first 50 values):", load_profile_list[:50])
-
-# --------------------------
+#%% --------------------------
 # PyPSA Model Setup
 # --------------------------
 
@@ -377,6 +463,13 @@ network.add("Carrier", "electricity")
 network.add("Bus", "main_bus", carrier="electricity")
 network.add("Bus", "pv_bus", carrier="electricity")
 network.add("Bus", "battery_bus", carrier="electricity")
+
+# Piecewise addition of the different load profiles from RAMP, LPG and the SLP
+total_load = (
+    np.array(RAMP_total_load_profile_list) 
+    + np.array(LPG_load_profile_list) 
+    + np.array(SLP_total_load_profiles_list)
+    ).tolist()
 
 # Add the load from pylpg
 network.add("Load", "household_load", bus="main_bus", p_set=total_load)
@@ -400,11 +493,11 @@ network.add("Generator", "pv_generator",
             capital_cost=100,  # €/kW
             marginal_cost=0,
             p_nom=100,  # Initial PV size (kW)
-            curtailment_rate_max=0,
+            curtailment_rate_max=1,
             p_max_pu=pv_profile_list)
 
 # Define battery parameters
-e_nom_fixed = 10  # kWh
+e_nom_fixed = 450  # kWh
 initial_state_of_charge = 0.8
 
 # Add a Store to represent the battery storage
@@ -478,15 +571,12 @@ define_cons_max_curtailment(network, generator_name="pv_generator") # Attach the
 print(network.model) # print all variables and constrains used in the model
 network.optimize.solve_model() # Solve model
 
-
 # Print optimal values
 print("Optimized PV Capacity (kW):", network.generators.p_nom_opt["pv_generator"])
 print("Battery Capacity (kWh):", network.stores.e_nom_opt["battery_storage"])
 print("Direct link to consumer (kW):", network.links.p_nom_opt["pv_to_load"])
 print("Link to Charge (kW):", network.links.p_nom_opt["battery_charge"])
 print("Link to Discharge (kW):", network.links.p_nom_opt["battery_discharge"])
-
-
 
 # Extract results for plotting
 battery_soc = network.stores_t.e["battery_storage"]
@@ -510,9 +600,9 @@ markersize = 5
 linewidth_dashed = 2
 linewidth_dotted = linewidth_dashed+1
 # --- Subplot 1: Load, PV Generation, and Battery Interaction ---
-axes[0].plot(network.snapshots, load_profile_res, label="Load (kW)", color="red", linestyle="-", marker="x", markersize = markersize)
+axes[0].plot(network.snapshots, load_profile_res, label="Load (kW)", color="red", linestyle="-")
 axes[0].plot(network.snapshots, pv_generation_res, label="PV Generation (kW)", color="green", linestyle="--", linewidth = linewidth_dashed)
-axes[0].plot(network.snapshots, direct, label="Direct to Load (kW)", color="brown", marker="v", markersize = markersize)
+# axes[0].plot(network.snapshots, direct, label="Direct to Load (kW)", color="brown", marker="v", markersize = markersize)
 axes[0].plot(network.snapshots, -battery_charge_res, label="Battery Charging (kW)", linestyle="dotted", color="purple", linewidth = linewidth_dotted)
 axes[0].plot(network.snapshots, battery_discharge_res, label="Battery Discharging (kW)", linestyle="dotted", color="orange", linewidth = linewidth_dotted)
 
