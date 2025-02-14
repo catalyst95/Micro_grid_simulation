@@ -27,12 +27,19 @@
 # Integrated Standard load profiles from the BDEW
 # Implemented R to Python interface via rpy2 package
 
+# V3.0
+# Integrated simple e-mobility model
+# Implemented a single vehicle with exactly defined user behaviour (no randomness)
+# Driving modelled as a load for the vehicle battery
+# Vehicle Charging through a link to the grid
+# Vehicle Charging window implemented (No charging outside of window)
+
 # ---------------------------------TODO---------------------------------
 # Implement addition of new consumers
 # Implement a parser to control the simulation 
-# Develop E-Mobility model
 # Nachvollziehbarkeit der Berechnung sicherstellen
 # Prepare for RAMP input via .csv (or .xlsx) from VITO 
+# Implement multiple independent vehicles (fleet)
 
 import rpy2.robjects as robjects
 import rpy2.robjects.packages as rpackages
@@ -62,6 +69,9 @@ startdate = "2023-01-01"
 startdate_dt = datetime.strptime(startdate, "%Y-%m-%d")
 enddate_dt = startdate_dt + timedelta(days=n_days-1)
 enddate = enddate_dt.strftime("%Y-%m-%d")
+
+# Define time snapshots (n_hours, hourly resolution)
+snapshots = pd.date_range(startdate, periods=n_hours, freq="h")
 
 #%% --------------------------
 # Integration of Standard load profiles according to BDEW
@@ -452,8 +462,7 @@ else:
 # Create a new PyPSA network
 network = pypsa.Network()
 
-# Define time snapshots (n_hours, hourly resolution)
-snapshots = pd.date_range(startdate, periods=n_hours, freq="h")
+# set network snapshots
 network.set_snapshots(snapshots)
 
 # Add an electricity carrier
@@ -472,7 +481,7 @@ total_load = (
     ).tolist()
 
 # Add the load from pylpg
-network.add("Load", "household_load", bus="main_bus", p_set=total_load)
+network.add("Load", "total_load", bus="main_bus", p_set=total_load)
 
 # # Add a constant load
 # network.add("Load", "Constant_Load", bus="main_bus", p_set=[20] * n_hours)
@@ -541,6 +550,62 @@ network.add("Link", "pv_to_load",
             p_nom=40,
             p_nom_extendable=True)
 
+#%% --------------------------
+# Integration of e-mobility
+# --------------------------
+
+network.add("Bus", "BEV_bus", carrier="electricity")
+
+e_nom_fixed_BEV = 6.1 # kWh (6.1=Renault Twizzy)
+initial_state_of_charge_BEV = 0.8
+network.add("Store","BEV_battery",
+            bus="BEV_bus",
+            carrier="electricity",
+            e_nom=e_nom_fixed_BEV,  # Storage capacity (kWh)
+            e_nom_extendable=False,
+            capital_cost=100,  # €/kWh
+            marginal_cost=0,
+            e_initial=e_nom_fixed * initial_state_of_charge_BEV,  # Initial stored energy (kWh)
+            e_cyclic=True)
+
+power_demand_hourly = 1 # kW
+duration_per_trip = 2 # hours 
+departure_hour = 6
+work_time_hours = 8
+arrival_hour = (departure_hour + duration_per_trip + work_time_hours + duration_per_trip)
+buffer_time = 24- arrival_hour
+
+# Define the daily BEV usage pattern (24 hours)
+daily_pattern = ([0.0] * departure_hour 
+                 + [power_demand_hourly] * duration_per_trip 
+                 + [0.0] * work_time_hours
+                 + [power_demand_hourly] * duration_per_trip 
+                 + [0.0] * buffer_time )
+
+# Repeat the pattern for every day in snapshots
+bev_usage = pd.Series(np.tile(daily_pattern, n_days), index=snapshots)
+# print(bev_usage.head(48))
+
+network.add("Load", "driving", bus="BEV_bus", p_set=bev_usage)
+
+# Initialize the series with zeros
+bev_charger_p_max_pu = pd.Series(0, index=snapshots)
+
+# Set the value to 1.0 for every day between 09:00 and 16:00
+for day in snapshots.normalize().unique(): # normalize removes the time component and unique ensures that only 1 entry is taken per day
+    bev_charger_p_max_pu.loc[day + pd.Timedelta(hours=arrival_hour) : day + pd.Timedelta(hours=23)] = 1.0
+
+# Print first 48 values to verify
+# print(charger_p_max_pu.head(48))
+
+network.add("Link","BEV_charger",
+            bus0="main_bus",
+            bus1="BEV_bus",
+            p_nom=2,  
+            p_max_pu=bev_charger_p_max_pu,
+            p_nom_extendable=False,
+            efficiency=1.0,)
+
 #  Custom Constraint 
 def define_cons_max_curtailment(network, generator_name):
     """
@@ -578,13 +643,23 @@ print("Direct link to consumer (kW):", network.links.p_nom_opt["pv_to_load"])
 print("Link to Charge (kW):", network.links.p_nom_opt["battery_charge"])
 print("Link to Discharge (kW):", network.links.p_nom_opt["battery_discharge"])
 
+print("Vehicle Charger capacity(kW):", network.links.p_nom_opt["BEV_charger"])
+print("Vehicle Battery capacity (kWh):", network.stores.e_nom_opt["BEV_battery"])
+
+
 # Extract results for plotting
 battery_soc = network.stores_t.e["battery_storage"]
-load_profile_res = network.loads_t.p["household_load"]
+load_profile_res = network.loads_t.p["total_load"]
 pv_generation_res = network.generators_t.p["pv_generator"]
+battery_soc = network.stores_t.e["battery_storage"]
 battery_charge_res = network.links_t.p0["battery_charge"]
 battery_discharge_res = network.links_t.p0["battery_discharge"]
 direct = network.links_t.p0["pv_to_load"]
+
+driving_load_profile_res = network.loads_t.p["driving"]
+bev_battery_charge_res = network.links_t.p0["BEV_charger"]
+bev_battery_soc = network.stores_t.e["BEV_battery"]
+
 
 # Fetch optimized values
 optimized_pv = network.generators.p_nom_opt["pv_generator"]
@@ -593,10 +668,13 @@ optimized_direct_link = network.links.p_nom_opt["pv_to_load"]
 optimized_battery_charge = network.links.p_nom_opt["battery_charge"]
 optimized_battery_discharge = network.links.p_nom_opt["battery_discharge"]
 
+optimized_vehicle_battery = network.stores.e_nom_opt["BEV_battery"]
+optimized_vehicle_charger = network.links.p_nom_opt["BEV_charger"]
+
 # Create figure with two subplots
 fig, axes = plt.subplots(nrows=2, ncols=1, figsize=(12, 8), sharex=True, gridspec_kw={'height_ratios': [1, 1]})
 
-markersize = 5
+markersize = 0
 linewidth_dashed = 2
 linewidth_dotted = linewidth_dashed+1
 # --- Subplot 1: Load, PV Generation, and Battery Interaction ---
@@ -604,7 +682,10 @@ axes[0].plot(network.snapshots, load_profile_res, label="Load (kW)", color="red"
 axes[0].plot(network.snapshots, pv_generation_res, label="PV Generation (kW)", color="green", linestyle="--", linewidth = linewidth_dashed)
 # axes[0].plot(network.snapshots, direct, label="Direct to Load (kW)", color="brown", marker="v", markersize = markersize)
 axes[0].plot(network.snapshots, -battery_charge_res, label="Battery Charging (kW)", linestyle="dotted", color="purple", linewidth = linewidth_dotted)
-axes[0].plot(network.snapshots, battery_discharge_res, label="Battery Discharging (kW)", linestyle="dotted", color="orange", linewidth = linewidth_dotted)
+axes[0].plot(network.snapshots, battery_discharge_res, label="Battery Discharging (kW)", linestyle="dotted", color="blue", linewidth = linewidth_dotted)
+
+axes[0].plot(network.snapshots, driving_load_profile_res, label="Driving Load (kW)", color="gold", linestyle="-")
+axes[0].plot(network.snapshots, -bev_battery_charge_res, label="Vehicle Battery Charging (kW)", linestyle="dotted", color="orange", linewidth = linewidth_dotted)
 
 axes[0].set_title("Power Flow in the Microgrid")
 axes[0].set_ylabel("Power (kW)")
@@ -613,12 +694,11 @@ axes[0].grid()
 
 # --- Subplot 2: Battery SoC ---
 axes[1].plot(network.snapshots, battery_soc, label="Battery SoC (kWh)", color="blue", marker="o", markersize = markersize)
+axes[1].plot(network.snapshots, bev_battery_soc, label="Vehicle Battery SoC (kWh)", color="red", marker="x", markersize = markersize)
 
-if network.stores.e_nom_opt.empty:
-    battery_capacity = network.stores.e_nom["battery_storage"]
-else:
-    battery_capacity = network.stores.e_nom_opt["battery_storage"]
-axes[1].axhline(y=battery_capacity, color="gray", linestyle="--", label="Battery Capacity (kWh)")
+axes[1].axhline(y=optimized_battery, color="gray", linestyle="--", label="Battery Capacity (kWh)")
+axes[1].axhline(y=optimized_vehicle_battery, color="gray", linestyle="dotted", label="Vehicle Battery Capacity (kWh)")
+
 
 axes[1].set_title("Battery State of Charge")
 axes[1].set_xlabel("Time")
@@ -632,7 +712,10 @@ textstr = (
     f"Battery Capacity: {optimized_battery:.2f} kWh\n"
     f"Direct Link Capacity: {optimized_direct_link:.2f} kW\n"
     f"Battery Charge Capacity: {optimized_battery_charge:.2f} kW\n"
-    f"Battery Discharge Capacity: {optimized_battery_discharge:.2f} kW"
+    f"Battery Discharge Capacity: {optimized_battery_discharge:.2f} kW\n"
+
+    f"Vehicle Battery Capacity: {optimized_vehicle_battery:.2f} kWh\n"
+    f"Vehicle Charger Capacity: {optimized_vehicle_charger:.2f} kW"
 )
 
 # Add textbox in the first subplot
